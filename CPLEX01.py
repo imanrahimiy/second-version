@@ -11,7 +11,7 @@ class MineOptimizationDSS:
     def __init__(self, case_study_params=None):
         """Initialize parameters and containers."""
         defaults = {
-            'num_blocks': 100,
+            'num_blocks': 500,
             'num_periods': 6,
             'num_scenarios': 10,
             'block_weight': 15375,              # tons
