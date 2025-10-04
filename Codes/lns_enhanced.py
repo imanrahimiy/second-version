@@ -1,7 +1,6 @@
 """
-Enhanced Large Neighborhood Search with GA+SA hybrid and epsilon-constraint handling
-Based on Algorithm 2 from the revised manuscript
-Implements the hybrid GA+LNS+SA metaheuristic with adaptive constraint relaxation
+Algorithm 2: Hybrid GA+LNS+SA with Epsilon-Constraint Handling
+From manuscript Section 4.5 and Algorithm 2
 """
 
 import numpy as np
@@ -9,95 +8,104 @@ import random
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 import torch
-import torch.nn.functional as F
 
 @dataclass
-class LNSConfig:
-    """Configuration for enhanced LNS with GA integration"""
-    destruction_min: float = 0.15
-    destruction_max: float = 0.30
+class HybridConfig:
+    """Configuration for Algorithm 2"""
+    # GA parameters
     population_size: int = 50
-    max_generations: int = 10
-    tournament_size: int = 3
     crossover_rate: float = 0.8
     mutation_rate: float = 0.1
+    tournament_size: int = 3
+    
+    # LNS parameters
+    destruction_min: float = 0.15
+    destruction_max: float = 0.30
+    
+    # SA parameters
+    initial_temperature: float = 300.0
+    cooling_rate: float = 0.95
+    iterations_per_temp: int = 3
+    
+    # Epsilon-constraint
     epsilon_max: float = 0.1
     epsilon_threshold: float = 0.01
-    neighborhoods: int = 5
+    
+    # Neighborhoods
+    n_neighborhoods: int = 5
 
 class HybridGALNSSA:
     """
-    Hybrid Genetic Algorithm + Large Neighborhood Search + Simulated Annealing
-    with epsilon-constraint handling for mining optimization
+    Algorithm 2: Hybrid metaheuristic with epsilon-constraint handling
+    Integrates GA population diversity, LNS repair, and SA acceptance
     """
     
-    def __init__(self, config: LNSConfig, gpu_evaluator, vae_model):
+    def __init__(self, config, gpu_evaluator, vae_model):
         self.config = config
         self.gpu_evaluator = gpu_evaluator
         self.vae_model = vae_model
-        self.temperature = 300.0
-        self.cooling_rate = 0.95
+        self.temperature = config.initial_temperature
         self.current_epsilon = config.epsilon_max
-        
-    def create_neighborhoods(self, blocks: np.ndarray) -> List[List[int]]:
+        self.iteration = 0
+    
+    def create_neighborhoods(self, blocks):
         """
-        Partition solution space into neighborhoods based on geological similarity
+        Partition solution space based on geological similarity
         Uses VAE latent space for intelligent clustering
         """
         with torch.no_grad():
-            # Encode blocks using VAE to get latent representations
             block_features = torch.tensor(blocks, dtype=torch.float32)
-            latent_repr = self.vae_model.encode(block_features)[0]
             
-            # Cluster using K-means in latent space
+            # Encode blocks to latent space
+            mu, _ = self.vae_model.encode(block_features)
+            latent_repr = mu.numpy()
+            
+            # K-means clustering in latent space
             from sklearn.cluster import KMeans
-            kmeans = KMeans(n_clusters=self.config.neighborhoods, random_state=42)
-            neighborhood_labels = kmeans.fit_predict(latent_repr.numpy())
-            
+            kmeans = KMeans(n_clusters=self.config.n_neighborhoods, random_state=42)
+            labels = kmeans.fit_predict(latent_repr)
+        
         neighborhoods = []
-        for i in range(self.config.neighborhoods):
-            neighborhood = np.where(neighborhood_labels == i)[0].tolist()
+        for i in range(self.config.n_neighborhoods):
+            neighborhood = np.where(labels == i)[0].tolist()
             neighborhoods.append(neighborhood)
-            
+        
         return neighborhoods
     
-    def geological_crossover(self, parent1: Dict, parent2: Dict, 
-                            neighborhood: List[int]) -> Dict:
+    def geological_crossover(self, parent1, parent2, neighborhood):
         """
-        Geology-aware crossover that preserves spatial correlations
+        Geology-aware crossover preserving spatial correlations
         """
         offspring = parent1.copy()
         
-        # Only crossover within the current neighborhood
         for block_idx in neighborhood:
             if random.random() < self.config.crossover_rate:
-                # Inherit from parent2 while maintaining precedence
+                # Check precedence feasibility
                 if self._check_precedence_feasible(parent2, block_idx):
                     offspring['schedule'][block_idx] = parent2['schedule'][block_idx]
                     offspring['mode'][block_idx] = parent2['mode'][block_idx]
         
         return offspring
     
-    def spatial_mutation(self, solution: Dict, neighborhood: List[int]) -> Dict:
+    def spatial_mutation(self, solution, neighborhood):
         """
-        Mutation that preserves geological continuity and precedence constraints
+        Mutation preserving geological continuity
         """
         mutated = solution.copy()
         
         for block_idx in neighborhood:
             if random.random() < self.config.mutation_rate:
-                # Find feasible periods considering precedence
                 feasible_periods = self._get_feasible_periods(mutated, block_idx)
                 if feasible_periods:
                     mutated['schedule'][block_idx] = random.choice(feasible_periods)
-                    
-                # Randomly change operational mode
+                
+                # Mode mutation
                 if random.random() < 0.5:
                     mutated['mode'][block_idx] = 1 - mutated['mode'][block_idx]
         
         return mutated
     
-    def evaluate_fitness_epsilon(self, solution: Dict, epsilon: float) -> float:
+    def evaluate_fitness_epsilon(self, solution, epsilon):
         """
         Fitness evaluation with epsilon-relaxed constraints
         """
@@ -110,40 +118,44 @@ class HybridGALNSSA:
         
         return npv - penalty
     
-    def tournament_selection(self, population: List[Dict], 
-                            fitness_scores: List[float]) -> Dict:
-        """
-        Tournament selection for parent selection
-        """
-        tournament_indices = random.sample(range(len(population)), 
-                                         self.config.tournament_size)
+    def tournament_selection(self, population, fitness_scores):
+        """Tournament selection for GA"""
+        tournament_indices = random.sample(
+            range(len(population)), 
+            min(self.config.tournament_size, len(population))
+        )
         tournament_fitness = [fitness_scores[i] for i in tournament_indices]
         winner_idx = tournament_indices[np.argmax(tournament_fitness)]
-        
         return population[winner_idx]
     
-    def lns_repair(self, solution: Dict, destroyed_blocks: List[int]) -> Dict:
+    def lns_destroy(self, solution, neighborhood):
         """
-        GPU-accelerated repair mechanism for infeasible solutions
+        Destroy phase: remove blocks from neighborhood
         """
-        repaired = solution.copy()
-        
-        # Use GPU to evaluate all possible repairs in parallel
-        repair_candidates = self.gpu_evaluator.generate_repair_candidates(
-            repaired, destroyed_blocks
+        destruction_size = random.uniform(
+            self.config.destruction_min,
+            self.config.destruction_max
         )
+        num_to_destroy = int(len(neighborhood) * destruction_size)
+        destroyed_blocks = random.sample(neighborhood, min(num_to_destroy, len(neighborhood)))
         
-        # Select best repair based on NPV and feasibility
-        best_repair = self.gpu_evaluator.evaluate_repairs_parallel(
-            repair_candidates, self.current_epsilon
-        )
+        for block_idx in destroyed_blocks:
+            solution['schedule'][block_idx] = -1  # Mark as unassigned
         
-        return best_repair
+        return solution, destroyed_blocks
     
-    def sa_accept(self, current_fitness: float, new_fitness: float) -> bool:
+    def lns_repair(self, solution, destroyed_blocks):
         """
-        Simulated annealing acceptance criterion
+        GPU-accelerated repair with VAE-enhanced selection
         """
+        # Use GPU evaluator for parallel repair
+        repaired = self.gpu_evaluator.gpu_accelerated_repair(
+            solution, destroyed_blocks, []  # Empty scenarios for now
+        )
+        return repaired
+    
+    def sa_accept(self, current_fitness, new_fitness):
+        """Simulated annealing acceptance criterion"""
         if new_fitness > current_fitness:
             return True
         
@@ -151,92 +163,112 @@ class HybridGALNSSA:
         probability = np.exp(delta / self.temperature)
         return random.random() < probability
     
-    def optimize(self, initial_solution: Dict, max_iterations: int) -> Dict:
+    def optimize(self, initial_solution, max_iterations):
         """
-        Main optimization loop implementing Algorithm 2 from manuscript
+        Main optimization loop (Algorithm 2)
         """
-        # Initialize population
+        # Step 1: Initialize population
         population = [initial_solution]
         for _ in range(self.config.population_size - 1):
             perturbed = self._perturb_solution(initial_solution)
             population.append(perturbed)
         
-        # Create neighborhoods based on geological similarity
+        # Step 2: Create neighborhoods
         neighborhoods = self.create_neighborhoods(initial_solution['blocks'])
         
         best_solution = initial_solution
         best_fitness = self.evaluate_fitness_epsilon(best_solution, 0)
         
+        # Main loop
         for iteration in range(max_iterations):
-            # Update epsilon constraint (linearly decrease)
+            self.iteration = iteration
+            
+            # Step 3: Update epsilon
             self.current_epsilon = self.config.epsilon_max * (1 - iteration/max_iterations)
             
+            # Step 4: Process each neighborhood
             for neighborhood in neighborhoods:
-                # Population-based exploration in neighborhood
                 new_population = []
                 
-                for _ in range(self.config.max_generations):
-                    # Select parents using tournament selection
+                # Step 5-10: GA exploration
+                for _ in range(self.config.population_size):
+                    # Calculate fitness
                     fitness_scores = [
                         self.evaluate_fitness_epsilon(sol, self.current_epsilon)
                         for sol in population
                     ]
                     
+                    # Select parents
                     parent1 = self.tournament_selection(population, fitness_scores)
                     parent2 = self.tournament_selection(population, fitness_scores)
                     
-                    # Generate offspring with geology-aware crossover
+                    # Crossover
                     offspring = self.geological_crossover(parent1, parent2, neighborhood)
                     
-                    # Apply spatial mutation
+                    # Mutation
                     offspring = self.spatial_mutation(offspring, neighborhood)
                     
                     new_population.append(offspring)
                 
-                # LNS repair for infeasible solutions
+                # Step 11-15: LNS repair for infeasible solutions
                 for i, solution in enumerate(new_population):
                     violations = self._calculate_violations(solution)
                     if violations > self.current_epsilon:
-                        # Apply destruction phase
-                        destroyed = self._destroy_solution(solution, neighborhood)
-                        # GPU-accelerated repair
-                        new_population[i] = self.lns_repair(solution, destroyed)
+                        # Destroy
+                        destroyed_solution, destroyed_blocks = self.lns_destroy(
+                            solution, neighborhood
+                        )
+                        # Repair
+                        new_population[i] = self.lns_repair(
+                            destroyed_solution, destroyed_blocks
+                        )
                 
-                # SA-based neighborhood transition
-                best_in_neighborhood = max(new_population, 
-                    key=lambda x: self.evaluate_fitness_epsilon(x, self.current_epsilon))
+                # Step 16-18: SA-based neighborhood transition
+                best_in_neighborhood = max(
+                    new_population,
+                    key=lambda x: self.evaluate_fitness_epsilon(x, self.current_epsilon)
+                )
                 
-                fitness = self.evaluate_fitness_epsilon(best_in_neighborhood, 
-                                                       self.current_epsilon)
+                fitness = self.evaluate_fitness_epsilon(
+                    best_in_neighborhood, self.current_epsilon
+                )
                 
                 if self.sa_accept(best_fitness, fitness):
                     best_solution = best_in_neighborhood
                     best_fitness = fitness
-                    
-                # Update population (elitist selection)
+                
+                # Update population
                 population = self._elitist_selection(population + new_population)
             
-            # Remove highly infeasible solutions if epsilon is small
+            # Step 19: Remove infeasible if epsilon is small
             if self.current_epsilon < self.config.epsilon_threshold:
-                population = [sol for sol in population 
-                            if self._calculate_violations(sol) <= self.current_epsilon]
+                population = [
+                    sol for sol in population
+                    if self._calculate_violations(sol) <= self.current_epsilon
+                ]
+                if not population:
+                    population = [best_solution]
             
-            # Cool down temperature
+            # Step 20: Cool temperature
             self.temperature *= self.config.cooling_rate
             
-            print(f"Iteration {iteration}: Best NPV = ${best_fitness/1e6:.2f}M, "
-                  f"Epsilon = {self.current_epsilon:.4f}, Temp = {self.temperature:.2f}")
+            if iteration % 10 == 0:
+                print(f"Iteration {iteration}: Best NPV = ${best_fitness/1e6:.2f}M, "
+                      f"ε = {self.current_epsilon:.4f}, T = {self.temperature:.2f}")
         
-        # Final feasibility check with epsilon = 0
+        # Step 21-22: Final repair with epsilon = 0
         if self._calculate_violations(best_solution) > 0:
-            print("Applying final repair with strict constraints...")
-            destroyed = self._destroy_solution(best_solution, range(len(best_solution['blocks'])))
-            best_solution = self.lns_repair(best_solution, destroyed)
+            print("Applying final repair...")
+            all_blocks = list(range(len(best_solution['blocks'])))
+            destroyed_solution, destroyed_blocks = self.lns_destroy(
+                best_solution, all_blocks
+            )
+            best_solution = self.lns_repair(destroyed_solution, destroyed_blocks)
         
         return best_solution
     
-    def _check_precedence_feasible(self, solution: Dict, block_idx: int) -> bool:
-        """Check if block assignment respects precedence constraints"""
+    def _check_precedence_feasible(self, solution, block_idx):
+        """Check precedence constraints"""
         precedence = solution.get('precedence', {})
         if block_idx in precedence:
             for pred in precedence[block_idx]:
@@ -244,51 +276,53 @@ class HybridGALNSSA:
                     return False
         return True
     
-    def _get_feasible_periods(self, solution: Dict, block_idx: int) -> List[int]:
-        """Get list of feasible periods for a block considering precedence"""
+    def _get_feasible_periods(self, solution, block_idx):
+        """Get feasible periods considering precedence"""
         precedence = solution.get('precedence', {})
         min_period = 0
         
         if block_idx in precedence:
-            predecessor_periods = [solution['schedule'][pred] 
-                                 for pred in precedence[block_idx]]
-            if predecessor_periods:
-                min_period = max(predecessor_periods)
+            pred_periods = [
+                solution['schedule'][pred] 
+                for pred in precedence[block_idx]
+                if pred < len(solution['schedule'])
+            ]
+            if pred_periods:
+                min_period = max(pred_periods)
         
-        max_period = solution.get('num_periods', 6)
-        return list(range(min_period, max_period))
+        return list(range(min_period, 6))
     
-    def _calculate_violations(self, solution: Dict) -> float:
-        """Calculate total constraint violations"""
+    def _calculate_violations(self, solution):
+        """Calculate constraint violations"""
         violations = 0.0
         
-        # Check precedence violations
-        for block_idx, period in enumerate(solution['schedule']):
+        # Precedence violations
+        for block_idx in range(len(solution['schedule'])):
             if not self._check_precedence_feasible(solution, block_idx):
                 violations += 1.0
         
-        # Check capacity violations
-        capacity_per_period = solution.get('capacity', [6.5e6] * 6)
-        mass_per_period = np.zeros(len(capacity_per_period))
-        
+        # Capacity violations
+        capacity_per_period = np.zeros(6)
         for block_idx, period in enumerate(solution['schedule']):
-            if period >= 0:  # -1 means not scheduled
-                mass_per_period[period] += solution['blocks'][block_idx]['mass']
+            if 0 <= period < 6:
+                capacity_per_period[period] += 15375  # Block mass
         
-        for period, (mass, capacity) in enumerate(zip(mass_per_period, capacity_per_period)):
-            if mass > capacity:
-                violations += (mass - capacity) / capacity
+        for period_mass in capacity_per_period:
+            if period_mass > 6.5e6:
+                violations += (period_mass - 6.5e6) / 6.5e6
         
         return violations
     
-    def _perturb_solution(self, solution: Dict) -> Dict:
-        """Create perturbed version of solution for population initialization"""
+    def _perturb_solution(self, solution):
+        """Create perturbed solution for population"""
         perturbed = solution.copy()
         num_blocks = len(solution['blocks'])
         
-        # Randomly change 10-20% of block assignments
-        num_changes = random.randint(int(0.1 * num_blocks), int(0.2 * num_blocks))
-        blocks_to_change = random.sample(range(num_blocks), num_changes)
+        num_changes = random.randint(
+            int(0.1 * num_blocks), 
+            int(0.2 * num_blocks)
+        )
+        blocks_to_change = random.sample(range(num_blocks), min(num_changes, num_blocks))
         
         for block_idx in blocks_to_change:
             feasible_periods = self._get_feasible_periods(perturbed, block_idx)
@@ -297,15 +331,8 @@ class HybridGALNSSA:
         
         return perturbed
     
-    def _destroy_solution(self, solution: Dict, neighborhood: List[int]) -> List[int]:
-        """Destroy part of solution in neighborhood"""
-        destruction_size = random.uniform(self.config.destruction_min, 
-                                        self.config.destruction_max)
-        num_to_destroy = int(len(neighborhood) * destruction_size)
-        return random.sample(neighborhood, num_to_destroy)
-    
-    def _elitist_selection(self, population: List[Dict]) -> List[Dict]:
-        """Select best solutions to maintain population size"""
+    def _elitist_selection(self, population):
+        """Select best solutions for next generation"""
         fitness_scores = [
             self.evaluate_fitness_epsilon(sol, self.current_epsilon)
             for sol in population

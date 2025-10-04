@@ -1,7 +1,6 @@
-# vae_model.py
 """
-Variational Autoencoder for geological uncertainty modeling
-Learns latent representation and generates new scenarios
+Variational Autoencoder for Geological Scenario Generation
+Implements VAE-based dynamic scenario generation as per Section 4.3-4.4 of manuscript
 """
 
 import torch
@@ -11,16 +10,13 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import pickle
 import os
-from config import VAEParameters, MODEL_DIR, DEVICE
-from data_generator import MiningDataGenerator
+from config import DEFAULT_VAE_PARAMS, MODEL_DIR, DEVICE
 
 class GeologicalDataset(Dataset):
-    """PyTorch Dataset for geological features"""
+    """PyTorch Dataset for geological features as per manuscript Section 4.4"""
     
     def __init__(self, data_dict):
-        """
-        Combine features: [grade, rock_type, alteration, structural, distance]
-        """
+        """Combine features: [grade, rock_type, alteration, structural, distance]"""
         features = np.column_stack([
             data_dict['base_grades'],
             data_dict['base_rock_types'],
@@ -29,24 +25,26 @@ class GeologicalDataset(Dataset):
             data_dict['geological_features']['distance_to_intrusion']
         ])
         self.data = torch.FloatTensor(features)
+        self.spatial_coords = torch.FloatTensor(data_dict['coordinates'])
     
     def __len__(self):
         return len(self.data)
     
     def __getitem__(self, idx):
-        return self.data[idx]
+        return self.data[idx], self.spatial_coords[idx]
 
 class GeologicalVAE(nn.Module):
     """
-    Variational Autoencoder for geological scenario generation
-    Architecture: Encoder -> Latent Space -> Decoder
+    VAE for geological scenario generation (Equations 3-7 from manuscript)
+    Implements dynamic scenario generation capability (50-200+ scenarios)
     """
     
-    def __init__(self, params: VAEParameters):
+    def __init__(self, params=DEFAULT_VAE_PARAMS):
         super(GeologicalVAE, self).__init__()
         self.params = params
+        self.latent_dim = params.latent_dim
         
-        # Encoder network
+        # Encoder network (Equations 3-4)
         encoder_layers = []
         prev_dim = params.input_dim
         
@@ -61,11 +59,11 @@ class GeologicalVAE(nn.Module):
         
         self.encoder = nn.Sequential(*encoder_layers)
         
-        # Latent space parameters
+        # Latent space parameters μ and log σ² (Equation 3-4)
         self.fc_mu = nn.Linear(params.hidden_dims[-1], params.latent_dim)
         self.fc_logvar = nn.Linear(params.hidden_dims[-1], params.latent_dim)
         
-        # Decoder network
+        # Decoder network (Equation 6)
         decoder_layers = []
         prev_dim = params.latent_dim
         
@@ -79,224 +77,141 @@ class GeologicalVAE(nn.Module):
             prev_dim = h_dim
         
         decoder_layers.append(nn.Linear(params.hidden_dims[0], params.input_dim))
-        
         self.decoder = nn.Sequential(*decoder_layers)
+        
+        # Dual conditioning for Dantzig-Wolfe integration
+        self.dual_conditioning = nn.Linear(10, params.latent_dim)
     
     def encode(self, x):
-        """Encode input to latent distribution parameters"""
+        """Encode to latent distribution (Equations 3-4)"""
         h = self.encoder(x)
         mu = self.fc_mu(h)
         logvar = self.fc_logvar(h)
         return mu, logvar
     
     def reparameterize(self, mu, logvar):
-        """Reparameterization trick for sampling from latent space"""
+        """Reparameterization trick (Equation 5)"""
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
     
     def decode(self, z):
-        """Decode latent vector to reconstruction"""
+        """Decode from latent space (Equation 6)"""
         return self.decoder(z)
     
     def forward(self, x):
-        """Full forward pass through VAE"""
+        """Full forward pass"""
         mu, logvar = self.encode(x)
         z = self.reparameterize(mu, logvar)
         reconstruction = self.decode(z)
         return reconstruction, mu, logvar
+    
+    def condition_on_duals(self, z, dual_values):
+        """Condition latent space on dual values for column generation"""
+        dual_embedding = self.dual_conditioning(dual_values)
+        return z + 0.1 * dual_embedding  # Soft conditioning
+    
+    def generate_scenarios(self, n_scenarios, dual_values=None):
+        """Generate n_scenarios (50-200+) geological realizations"""
+        self.eval()
+        with torch.no_grad():
+            z = torch.randn(n_scenarios, self.latent_dim).to(next(self.parameters()).device)
+            
+            if dual_values is not None:
+                z = self.condition_on_duals(z, dual_values)
+            
+            scenarios = self.decode(z)
+            return scenarios.cpu().numpy()
+    
+    def calculate_continuity_loss(self, x, coords):
+        """Geological continuity constraint for spatial correlation"""
+        batch_size = x.shape[0]
+        if batch_size < 2:
+            return torch.tensor(0.0)
+        
+        # Calculate pairwise distances
+        dist = torch.cdist(coords, coords)
+        
+        # Create weight matrix based on distance
+        weights = torch.exp(-dist / 50.0)  # 50m correlation range
+        weights.fill_diagonal_(0)
+        
+        # Grade continuity loss
+        grade_diff = (x[:, 0].unsqueeze(1) - x[:, 0].unsqueeze(0)).pow(2)
+        continuity_loss = (weights * grade_diff).sum() / weights.sum()
+        
+        return continuity_loss
 
-def vae_loss_function(recon_x, x, mu, logvar, beta=0.5, lambda_geo=0.1):
+def vae_loss_function(recon_x, x, mu, logvar, coords, beta=0.5, lambda_geo=0.1):
     """
-    VAE loss function with:
-    - Reconstruction loss (MSE)
-    - KL divergence (regularization)
-    - Geological continuity constraint
+    VAE loss (Equation 7) with geological constraints
+    L_VAE = L_reconstruction + β·L_KL + λ·L_geological
     """
     # Reconstruction loss
     recon_loss = nn.functional.mse_loss(recon_x, x, reduction='sum')
     
-    # KL divergence loss
+    # KL divergence
     kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
     
-    # Geological continuity constraint (smooth grade transitions)
-    if len(recon_x) > 1:
-        # Grade column (index 0)
-        grade_diff = torch.mean((recon_x[1:, 0] - recon_x[:-1, 0]).pow(2))
-        geo_loss = lambda_geo * grade_diff
-    else:
-        geo_loss = torch.tensor(0.0)
+    # Geological continuity constraint
+    vae = GeologicalVAE()
+    geo_loss = vae.calculate_continuity_loss(recon_x, coords)
     
-    total_loss = recon_loss + beta * kl_loss + geo_loss
+    total_loss = recon_loss + beta * kl_loss + lambda_geo * geo_loss
     
     return total_loss, recon_loss, kl_loss, geo_loss
 
-def train_vae(model, train_loader, params: VAEParameters, device=DEVICE):
-    """Train VAE model"""
+def train_vae(model, train_loader, params=DEFAULT_VAE_PARAMS, device=DEVICE):
+    """Train VAE for geological scenario generation"""
     optimizer = optim.Adam(model.parameters(), lr=params.learning_rate)
     model.train()
     model.to(device)
     
-    losses = {
-        'total': [],
-        'recon': [],
-        'kl': [],
-        'geo': []
-    }
-    
-    print("=" * 80)
-    print(f"TRAINING VAE ON {device}")
-    print("=" * 80)
+    losses = {'total': [], 'recon': [], 'kl': [], 'geo': []}
     
     for epoch in range(params.epochs):
         total_loss = 0
-        total_recon = 0
-        total_kl = 0
-        total_geo = 0
-        
-        for batch_idx, data in enumerate(train_loader):
-            data = data.to(device)
+        for batch_idx, (data, coords) in enumerate(train_loader):
+            data, coords = data.to(device), coords.to(device)
             
             optimizer.zero_grad()
-            
-            # Forward pass
             recon_batch, mu, logvar = model(data)
             
-            # Compute losses
             loss, recon_loss, kl_loss, geo_loss = vae_loss_function(
-                recon_batch, data, mu, logvar, beta=params.beta
+                recon_batch, data, mu, logvar, coords, 
+                beta=params.beta, lambda_geo=params.lambda_geo
             )
             
-            # Backward pass
             loss.backward()
             optimizer.step()
-            
             total_loss += loss.item()
-            total_recon += recon_loss.item()
-            total_kl += kl_loss.item()
-            total_geo += geo_loss.item()
         
-        # Average losses
-        n_samples = len(train_loader.dataset)
-        avg_loss = total_loss / n_samples
-        avg_recon = total_recon / n_samples
-        avg_kl = total_kl / n_samples
-        avg_geo = total_geo / n_samples
-        
+        avg_loss = total_loss / len(train_loader.dataset)
         losses['total'].append(avg_loss)
-        losses['recon'].append(avg_recon)
-        losses['kl'].append(avg_kl)
-        losses['geo'].append(avg_geo)
         
         if (epoch + 1) % 10 == 0:
-            print(f"Epoch {epoch+1:3d}/{params.epochs} | "
-                  f"Loss: {avg_loss:.4f} | "
-                  f"Recon: {avg_recon:.4f} | "
-                  f"KL: {avg_kl:.4f} | "
-                  f"Geo: {avg_geo:.4f}")
-    
-    print("=" * 80)
-    print("VAE TRAINING COMPLETE")
-    print("=" * 80)
+            print(f"Epoch {epoch+1}/{params.epochs} - Loss: {avg_loss:.4f}")
     
     return model, losses
 
-def generate_scenarios(model, n_scenarios, device=DEVICE):
-    """Generate new geological scenarios from trained VAE"""
-    model.eval()
-    model.to(device)
+def validate_geological_constraints(scenarios):
+    """Validate geological realism of generated scenarios"""
+    # Check spatial continuity
+    spatial_correlation = np.corrcoef(scenarios[:, 0], scenarios[:, 3])[0, 1]
     
-    with torch.no_grad():
-        # Sample from standard normal distribution
-        z = torch.randn(n_scenarios, model.params.latent_dim).to(device)
-        
-        # Decode to generate scenarios
-        scenarios = model.decode(z)
+    # Check grade-tonnage relationship
+    grade_tonnage_valid = np.corrcoef(scenarios[:, 0], scenarios[:, 4])[0, 1] < 0.3
     
-    return scenarios.cpu().numpy()
-
-def save_vae_model(model, losses=None, filename='vae_model.pt'):
-    """Save trained VAE model and training history"""
-    filepath = os.path.join(MODEL_DIR, filename)
+    # Check alteration patterns
+    alteration_valid = np.all(scenarios[:, 2] >= 0) and np.all(scenarios[:, 2] <= 1)
     
-    checkpoint = {
-        'model_state_dict': model.state_dict(),
-        'params': model.params,
-        'losses': losses
+    return {
+        'spatial_correlation': abs(spatial_correlation) > 0.2,
+        'grade_tonnage_valid': grade_tonnage_valid,
+        'alteration_valid': alteration_valid,
+        'overall_valid': all([
+            abs(spatial_correlation) > 0.2,
+            grade_tonnage_valid,
+            alteration_valid
+        ])
     }
-    
-    torch.save(checkpoint, filepath)
-    print(f"VAE model saved to {filepath}")
-
-def load_vae_model(params: VAEParameters, filename='vae_model.pt', device=DEVICE):
-    """Load trained VAE model"""
-    filepath = os.path.join(MODEL_DIR, filename)
-    
-    checkpoint = torch.load(filepath, map_location=device)
-    
-    model = GeologicalVAE(params)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.to(device)
-    model.eval()
-    
-    print(f"VAE model loaded from {filepath}")
-    
-    return model, checkpoint.get('losses', None)
-
-# ============================================================================
-# MAIN: Train VAE
-# ============================================================================
-
-if __name__ == '__main__':
-    from config import DEFAULT_VAE_PARAMS
-    
-    print("=" * 80)
-    print("VAE GEOLOGICAL MODELING")
-    print("=" * 80)
-    
-    # Load dataset
-    print("\nLoading mining dataset...")
-    dataset = MiningDataGenerator.load_dataset()
-    
-    # Create PyTorch dataset and dataloader
-    print("Preparing training data...")
-    geo_dataset = GeologicalDataset(dataset)
-    train_loader = DataLoader(
-        geo_dataset, 
-        batch_size=DEFAULT_VAE_PARAMS.batch_size,
-        shuffle=True,
-        num_workers=0
-    )
-    
-    print(f"Training samples: {len(geo_dataset)}")
-    print(f"Batch size: {DEFAULT_VAE_PARAMS.batch_size}")
-    print(f"Batches per epoch: {len(train_loader)}")
-    
-    # Create and train VAE
-    print("\nInitializing VAE...")
-    vae_model = GeologicalVAE(DEFAULT_VAE_PARAMS)
-    
-    print(f"Model parameters: {sum(p.numel() for p in vae_model.parameters()):,}")
-    print(f"Latent dimension: {DEFAULT_VAE_PARAMS.latent_dim}")
-    
-    # Train
-    trained_model, training_losses = train_vae(
-        vae_model, 
-        train_loader, 
-        DEFAULT_VAE_PARAMS,
-        device=DEVICE
-    )
-    
-    # Save model
-    print("\nSaving trained model...")
-    save_vae_model(trained_model, training_losses)
-    
-    # Test generation
-    print("\nTesting scenario generation...")
-    test_scenarios = generate_scenarios(trained_model, n_scenarios=10, device=DEVICE)
-    print(f"Generated {len(test_scenarios)} new scenarios")
-    print(f"Scenario shape: {test_scenarios.shape}")
-    
-    print("\n" + "=" * 80)
-    print("VAE TRAINING COMPLETE!")
-    print("=" * 80)
